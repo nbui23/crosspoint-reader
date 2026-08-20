@@ -85,6 +85,42 @@ size_t ContentOpfParser::write(const uint8_t* buffer, const size_t size) {
   return size;
 }
 
+bool ContentOpfParser::readItemRecord(std::string& out, const uint32_t expectedLen) {
+  uint32_t len = 0;
+  if (tempItemStore.read(&len, sizeof(len)) != static_cast<int>(sizeof(len))) {
+    return false;
+  }
+  if (expectedLen != ANY_RECORD_LENGTH && len != expectedLen) {
+    return false;
+  }
+  if (len > static_cast<uint32_t>(tempItemStore.available())) {
+    return false;
+  }
+
+  out.assign(len, '\0');
+  return len == 0 || tempItemStore.read(&out[0], len) == static_cast<int>(len);
+}
+
+void ContentOpfParser::indexItemStore() {
+  if (!tempItemStore) {
+    return;
+  }
+
+  itemIndex.reserve(ITEM_INDEX_INITIAL_CAPACITY);
+  tempItemStore.seek(0);
+  std::string itemId;
+  std::string href;
+  while (tempItemStore.available()) {
+    const auto offset = static_cast<uint32_t>(tempItemStore.position());
+    if (!readItemRecord(itemId) || !readItemRecord(href)) {
+      LOG_ERR("COF", "Item store is truncated at offset %lu", offset);
+      break;
+    }
+    itemIndex.push_back({fnvHash(itemId), static_cast<uint16_t>(itemId.size()), offset});
+  }
+  LOG_DBG("COF", "Rebuilt item index from the store with %zu entries", itemIndex.size());
+}
+
 void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name, const XML_Char** atts) {
   auto* self = static_cast<ContentOpfParser*>(userData);
   (void)atts;
@@ -119,6 +155,9 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
 
   if (self->state == IN_PACKAGE && (strcmp(name, "manifest") == 0 || strcmp(name, "opf:manifest") == 0)) {
     self->state = IN_MANIFEST;
+    // openFileForWrite truncates the store, so anything a previous <manifest> indexed is stale
+    self->itemIndex.clear();
+    self->itemIndex.reserve(ITEM_INDEX_INITIAL_CAPACITY);
     if (!Storage.openFileForWrite("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
       LOG_ERR("COF", "Couldn't open temp items file for writing. This is probably going to be a fatal error.");
     }
@@ -131,14 +170,15 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
       LOG_ERR("COF", "Couldn't open temp items file for reading. This is probably going to be a fatal error.");
     }
 
-    // Sort item index for binary search if we have enough items
-    if (self->itemIndex.size() >= LARGE_SPINE_THRESHOLD) {
-      std::sort(self->itemIndex.begin(), self->itemIndex.end(), [](const ItemIndexEntry& a, const ItemIndexEntry& b) {
-        return a.idHash < b.idHash || (a.idHash == b.idHash && a.idLen < b.idLen);
-      });
-      self->useItemIndex = true;
-      LOG_DBG("COF", "Using fast index for %zu manifest items", self->itemIndex.size());
+    // The <manifest> pass normally fills the index. If it did not - its write open failed, or an
+    // earlier </spine> released the index - recover it from the store rather than resolving nothing.
+    if (self->itemIndex.empty()) {
+      self->indexItemStore();
     }
+
+    // Sort the index so each <itemref> below can binary search it instead of rescanning .items.bin
+    std::sort(self->itemIndex.begin(), self->itemIndex.end(), itemIndexLess);
+    LOG_DBG("COF", "Indexed %zu manifest items", self->itemIndex.size());
     return;
   }
 
@@ -241,49 +281,47 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
   // Only run the spine parsing if there's a cache to add it to
   if (self->cache) {
     if (self->state == IN_SPINE && (strcmp(name, "itemref") == 0 || strcmp(name, "opf:itemref") == 0)) {
+      // Nothing to resolve idrefs against without the store, so skip the walk rather than letting
+      // every record read below fail against a closed file
+      if (!self->tempItemStore) {
+        return;
+      }
+
       for (int i = 0; atts[i]; i += 2) {
         if (strcmp(atts[i], "idref") == 0) {
           const std::string idref = atts[i + 1];
           std::string href;
           bool found = false;
 
-          if (self->useItemIndex) {
-            // Fast path: binary search
-            uint32_t targetHash = fnvHash(idref);
-            uint16_t targetLen = static_cast<uint16_t>(idref.size());
+          const ItemIndexEntry target{fnvHash(idref), static_cast<uint16_t>(idref.size()), 0};
+          auto it = std::lower_bound(self->itemIndex.begin(), self->itemIndex.end(), target, itemIndexLess);
 
-            auto it = std::lower_bound(self->itemIndex.begin(), self->itemIndex.end(),
-                                       ItemIndexEntry{targetHash, targetLen, 0},
-                                       [](const ItemIndexEntry& a, const ItemIndexEntry& b) {
-                                         return a.idHash < b.idHash || (a.idHash == b.idHash && a.idLen < b.idLen);
-                                       });
-
-            // Check for match (may need to check a few due to hash collisions)
-            while (it != self->itemIndex.end() && it->idHash == targetHash) {
-              self->tempItemStore.seek(it->fileOffset);
-              std::string itemId;
-              serialization::readString(self->tempItemStore, itemId);
-              if (itemId == idref) {
-                serialization::readString(self->tempItemStore, href);
-                found = true;
-                break;
-              }
-              ++it;
-            }
-          } else {
-            // Slow path: linear scan (for small manifests, keeps original behavior)
-            // TODO: This lookup is slow as need to scan through all items each time.
-            //       It can take up to 200ms per item when getting to 1500 items.
-            self->tempItemStore.seek(0);
+          // Entries sharing a hash and length are adjacent, so walk them until the id itself matches.
+          // Anything beyond that group differs in hash or length and therefore cannot be this idref.
+          while (it != self->itemIndex.end() && it->idHash == target.idHash && it->idLen == target.idLen) {
+            // Check the record against the index before trusting the offset. A failed or short SD
+            // write during <manifest> can leave later entries pointing at EOF or into the middle of a
+            // record, and reading one with serialization::readString would resize a std::string to an
+            // uninitialised or bogus length - fatal under -fno-exceptions. The linear scan this
+            // replaces was bounded by available(), so it degraded to "not found" instead.
             std::string itemId;
-            while (self->tempItemStore.available()) {
-              serialization::readString(self->tempItemStore, itemId);
-              serialization::readString(self->tempItemStore, href);
-              if (itemId == idref) {
-                found = true;
-                break;
-              }
+            if (!self->tempItemStore.seek(it->fileOffset) || !self->readItemRecord(itemId, it->idLen)) {
+              self->rejectedItemRecords++;
+              ++it;
+              continue;
             }
+
+            if (itemId == idref) {
+              // The id matched, so this is a real record start - but the href that follows it can
+              // still be the half of the record a short write dropped, so it is read checked too
+              if (self->readItemRecord(href)) {
+                found = true;
+              } else {
+                self->rejectedItemRecords++;
+              }
+              break;
+            }
+            ++it;
           }
 
           if (found && self->cache) {
@@ -347,6 +385,15 @@ void XMLCALL ContentOpfParser::endElement(void* userData, const XML_Char* name) 
   if (self->state == IN_SPINE && (strcmp(name, "spine") == 0 || strcmp(name, "opf:spine") == 0)) {
     self->state = IN_PACKAGE;
     self->tempItemStore.close();
+    // Reported once rather than per itemref: every log line also lands in the 16-entry RTC ring
+    // that crash reports are read back from, so a per-entry error would evict the crash context
+    if (self->rejectedItemRecords > 0) {
+      LOG_ERR("COF", "Item store held no valid record for %u indexed items", self->rejectedItemRecords);
+      self->rejectedItemRecords = 0;
+    }
+    // Nothing after the spine looks items up, so hand the index memory back before
+    // Epub::parseContentOpf runs its guide cover fallback, which loads whole XHTML files into RAM
+    std::vector<ItemIndexEntry>().swap(self->itemIndex);
     return;
   }
 

@@ -2,6 +2,7 @@
 #include <Print.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <vector>
 
 #include "Epub.h"
@@ -31,16 +32,28 @@ class ContentOpfParser final : public Print {
   FsFile tempItemStore;
   std::string coverItemId;
 
-  // Index for fast idref→href lookup (used only for large EPUBs)
+  // Index for fast idref→href lookup, built while parsing <manifest> and consumed while parsing <spine>
   struct ItemIndexEntry {
     uint32_t idHash;      // FNV-1a hash of itemId
     uint16_t idLen;       // length for collision reduction
     uint32_t fileOffset;  // offset in .items.bin
   };
   std::vector<ItemIndexEntry> itemIndex;
-  bool useItemIndex = false;
 
-  static constexpr uint16_t LARGE_SPINE_THRESHOLD = 400;
+  // Manifest size isn't known until </manifest>, so reserve enough for a typical book up front.
+  // Every growth is an allocate/copy/free cycle that fragments DRAM, and the first seven of them
+  // (1, 2, 4, ... 64 entries) happen while the manifest is still streaming in.
+  static constexpr size_t ITEM_INDEX_INITIAL_CAPACITY = 64;
+
+  // Ordering shared by the sort and the lookup. They must agree exactly, otherwise lower_bound
+  // silently misses entries, so keep a single definition rather than two matching lambdas.
+  // fileOffset breaks ties so that entries which collide on both hash and length stay in manifest
+  // order: std::sort is not stable, and a duplicate id must still resolve to the first item declared.
+  static bool itemIndexLess(const ItemIndexEntry& a, const ItemIndexEntry& b) {
+    if (a.idHash != b.idHash) return a.idHash < b.idHash;
+    if (a.idLen != b.idLen) return a.idLen < b.idLen;
+    return a.fileOffset < b.fileOffset;
+  }
 
   // FNV-1a hash function
   static uint32_t fnvHash(const std::string& s) {
@@ -51,6 +64,25 @@ class ContentOpfParser final : public Print {
     }
     return hash;
   }
+
+  // Count of indexed items whose record could not be read back, reported once at </spine>
+  uint16_t rejectedItemRecords = 0;
+
+  // Passed as expectedLen when the caller has no length to check against. A real record length is
+  // bounded by the size of the store, so it can never collide with this.
+  static constexpr uint32_t ANY_RECORD_LENGTH = UINT32_MAX;
+
+  // Reads one length-prefixed record of the shape serialization::writeString writes, refusing
+  // anything the store cannot actually hold and, when expectedLen is given, anything whose stored
+  // length disagrees with the index - so a corrupt header is rejected before it is allocated.
+  // serialization::readString cannot be used against a store that a failed SD write may have torn:
+  // it leaves its length uninitialised on a short read and resizes to it, which aborts under
+  // -fno-exceptions.
+  bool readItemRecord(std::string& out, uint32_t expectedLen = ANY_RECORD_LENGTH);
+
+  // Rebuilds itemIndex by scanning the item store, for the degraded cases where the <manifest>
+  // pass did not populate it.
+  void indexItemStore();
 
   static void startElement(void* userData, const XML_Char* name, const XML_Char** atts);
   static void characterData(void* userData, const XML_Char* s, int len);
