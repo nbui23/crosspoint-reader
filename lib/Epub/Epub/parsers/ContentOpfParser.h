@@ -2,6 +2,7 @@
 #include <Print.h>
 
 #include <algorithm>
+#include <cstdint>
 #include <vector>
 
 #include "Epub.h"
@@ -64,8 +65,23 @@ class ContentOpfParser final : public Print {
     return hash;
   }
 
+  // Count of indexed items whose record could not be read back, reported once at </spine>
+  uint16_t rejectedItemRecords = 0;
+
+  // Passed as expectedLen when the caller has no length to check against. A real record length is
+  // bounded by the size of the store, so it can never collide with this.
+  static constexpr uint32_t ANY_RECORD_LENGTH = UINT32_MAX;
+
+  // Reads one length-prefixed record of the shape serialization::writeString writes, refusing
+  // anything the store cannot actually hold and, when expectedLen is given, anything whose stored
+  // length disagrees with the index - so a corrupt header is rejected before it is allocated.
+  // serialization::readString cannot be used against a store that a failed SD write may have torn:
+  // it leaves its length uninitialised on a short read and resizes to it, which aborts under
+  // -fno-exceptions.
+  bool readItemRecord(std::string& out, uint32_t expectedLen = ANY_RECORD_LENGTH);
+
   // Rebuilds itemIndex by scanning the item store, for the degraded cases where the <manifest>
-  // pass did not populate it. Bounded by available(), like the linear scan it stands in for.
+  // pass did not populate it.
   void indexItemStore();
 
   static void startElement(void* userData, const XML_Char* name, const XML_Char** atts);

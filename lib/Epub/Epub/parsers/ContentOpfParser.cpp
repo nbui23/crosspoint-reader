@@ -85,6 +85,22 @@ size_t ContentOpfParser::write(const uint8_t* buffer, const size_t size) {
   return size;
 }
 
+bool ContentOpfParser::readItemRecord(std::string& out, const uint32_t expectedLen) {
+  uint32_t len = 0;
+  if (tempItemStore.read(&len, sizeof(len)) != static_cast<int>(sizeof(len))) {
+    return false;
+  }
+  if (expectedLen != ANY_RECORD_LENGTH && len != expectedLen) {
+    return false;
+  }
+  if (len > static_cast<uint32_t>(tempItemStore.available())) {
+    return false;
+  }
+
+  out.assign(len, '\0');
+  return len == 0 || tempItemStore.read(&out[0], len) == static_cast<int>(len);
+}
+
 void ContentOpfParser::indexItemStore() {
   if (!tempItemStore) {
     return;
@@ -96,8 +112,10 @@ void ContentOpfParser::indexItemStore() {
   std::string href;
   while (tempItemStore.available()) {
     const auto offset = static_cast<uint32_t>(tempItemStore.position());
-    serialization::readString(tempItemStore, itemId);
-    serialization::readString(tempItemStore, href);
+    if (!readItemRecord(itemId) || !readItemRecord(href)) {
+      LOG_ERR("COF", "Item store is truncated at offset %lu", offset);
+      break;
+    }
     itemIndex.push_back({fnvHash(itemId), static_cast<uint16_t>(itemId.size()), offset});
   }
   LOG_DBG("COF", "Rebuilt item index from the store with %zu entries", itemIndex.size());
@@ -282,31 +300,26 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
           // Entries sharing a hash and length are adjacent, so walk them until the id itself matches.
           // Anything beyond that group differs in hash or length and therefore cannot be this idref.
           while (it != self->itemIndex.end() && it->idHash == target.idHash && it->idLen == target.idLen) {
-            // Read the id's length prefix and check it against the index before trusting the offset.
-            // A failed or short SD write during <manifest> can leave later entries pointing at EOF or
-            // into the middle of a record, and serialization::readString would then resize a
-            // std::string to an uninitialised or bogus length - fatal under -fno-exceptions. The
-            // linear scan this replaces was bounded by available(), so it degraded to "not found".
-            uint32_t storedIdLen = 0;
-            if (!self->tempItemStore.seek(it->fileOffset) ||
-                self->tempItemStore.read(&storedIdLen, sizeof(storedIdLen)) != static_cast<int>(sizeof(storedIdLen)) ||
-                static_cast<uint16_t>(storedIdLen) != it->idLen ||
-                storedIdLen > static_cast<uint32_t>(self->tempItemStore.available())) {
-              LOG_ERR("COF", "Item store does not hold a record at offset %lu", it->fileOffset);
-              ++it;
-              continue;
-            }
-
-            std::string itemId(storedIdLen, '\0');
-            if (storedIdLen > 0 && self->tempItemStore.read(&itemId[0], storedIdLen) != static_cast<int>(storedIdLen)) {
+            // Check the record against the index before trusting the offset. A failed or short SD
+            // write during <manifest> can leave later entries pointing at EOF or into the middle of a
+            // record, and reading one with serialization::readString would resize a std::string to an
+            // uninitialised or bogus length - fatal under -fno-exceptions. The linear scan this
+            // replaces was bounded by available(), so it degraded to "not found" instead.
+            std::string itemId;
+            if (!self->tempItemStore.seek(it->fileOffset) || !self->readItemRecord(itemId, it->idLen)) {
+              self->rejectedItemRecords++;
               ++it;
               continue;
             }
 
             if (itemId == idref) {
-              // The id matched, so this is a real record start and the href prefix follows it
-              serialization::readString(self->tempItemStore, href);
-              found = true;
+              // The id matched, so this is a real record start - but the href that follows it can
+              // still be the half of the record a short write dropped, so it is read checked too
+              if (self->readItemRecord(href)) {
+                found = true;
+              } else {
+                self->rejectedItemRecords++;
+              }
               break;
             }
             ++it;
@@ -373,6 +386,11 @@ void XMLCALL ContentOpfParser::endElement(void* userData, const XML_Char* name) 
   if (self->state == IN_SPINE && (strcmp(name, "spine") == 0 || strcmp(name, "opf:spine") == 0)) {
     self->state = IN_PACKAGE;
     self->tempItemStore.close();
+    // Reported once rather than per itemref: every log line also lands in the 16-entry RTC ring
+    // that crash reports are read back from, so a per-entry error would evict the crash context
+    if (self->rejectedItemRecords > 0) {
+      LOG_ERR("COF", "Item store held no valid record for %u indexed items", self->rejectedItemRecords);
+    }
     // Nothing after the spine looks items up, so hand the index memory back before
     // Epub::parseContentOpf runs its guide cover fallback, which loads whole XHTML files into RAM
     std::vector<ItemIndexEntry>().swap(self->itemIndex);
