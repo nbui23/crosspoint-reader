@@ -281,9 +281,8 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
   // Only run the spine parsing if there's a cache to add it to
   if (self->cache) {
     if (self->state == IN_SPINE && (strcmp(name, "itemref") == 0 || strcmp(name, "opf:itemref") == 0)) {
-      // Without the temp item store there is nothing to resolve idrefs against. Bail out rather than
-      // seeking a closed file: serialization::readString would then resize a std::string to an
-      // uninitialised length, which aborts the firmware under -fno-exceptions.
+      // Nothing to resolve idrefs against without the store, so skip the walk rather than letting
+      // every record read below fail against a closed file
       if (!self->tempItemStore) {
         return;
       }
@@ -390,6 +389,7 @@ void XMLCALL ContentOpfParser::endElement(void* userData, const XML_Char* name) 
     // that crash reports are read back from, so a per-entry error would evict the crash context
     if (self->rejectedItemRecords > 0) {
       LOG_ERR("COF", "Item store held no valid record for %u indexed items", self->rejectedItemRecords);
+      self->rejectedItemRecords = 0;
     }
     // Nothing after the spine looks items up, so hand the index memory back before
     // Epub::parseContentOpf runs its guide cover fallback, which loads whole XHTML files into RAM
