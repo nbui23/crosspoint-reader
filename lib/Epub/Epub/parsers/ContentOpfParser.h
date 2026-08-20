@@ -64,6 +64,10 @@ class ContentOpfParser final : public Print {
     return hash;
   }
 
+  // Rebuilds itemIndex by scanning the item store, for the degraded cases where the <manifest>
+  // pass did not populate it. Bounded by available(), like the linear scan it stands in for.
+  void indexItemStore();
+
   static void startElement(void* userData, const XML_Char* name, const XML_Char** atts);
   static void characterData(void* userData, const XML_Char* s, int len);
   static void endElement(void* userData, const XML_Char* name);

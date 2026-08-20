@@ -85,6 +85,24 @@ size_t ContentOpfParser::write(const uint8_t* buffer, const size_t size) {
   return size;
 }
 
+void ContentOpfParser::indexItemStore() {
+  if (!tempItemStore) {
+    return;
+  }
+
+  itemIndex.reserve(ITEM_INDEX_INITIAL_CAPACITY);
+  tempItemStore.seek(0);
+  std::string itemId;
+  std::string href;
+  while (tempItemStore.available()) {
+    const auto offset = static_cast<uint32_t>(tempItemStore.position());
+    serialization::readString(tempItemStore, itemId);
+    serialization::readString(tempItemStore, href);
+    itemIndex.push_back({fnvHash(itemId), static_cast<uint16_t>(itemId.size()), offset});
+  }
+  LOG_DBG("COF", "Rebuilt item index from the store with %zu entries", itemIndex.size());
+}
+
 void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name, const XML_Char** atts) {
   auto* self = static_cast<ContentOpfParser*>(userData);
   (void)atts;
@@ -119,6 +137,8 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
 
   if (self->state == IN_PACKAGE && (strcmp(name, "manifest") == 0 || strcmp(name, "opf:manifest") == 0)) {
     self->state = IN_MANIFEST;
+    // openFileForWrite truncates the store, so anything a previous <manifest> indexed is stale
+    self->itemIndex.clear();
     self->itemIndex.reserve(ITEM_INDEX_INITIAL_CAPACITY);
     if (!Storage.openFileForWrite("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
       LOG_ERR("COF", "Couldn't open temp items file for writing. This is probably going to be a fatal error.");
@@ -130,6 +150,12 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
     self->state = IN_SPINE;
     if (!Storage.openFileForRead("COF", self->cachePath + itemCacheFile, self->tempItemStore)) {
       LOG_ERR("COF", "Couldn't open temp items file for reading. This is probably going to be a fatal error.");
+    }
+
+    // The <manifest> pass normally fills the index. If it did not - its write open failed, or an
+    // earlier </spine> released the index - recover it from the store rather than resolving nothing.
+    if (self->itemIndex.empty()) {
+      self->indexItemStore();
     }
 
     // Sort the index so each <itemref> below can binary search it instead of rescanning .items.bin
@@ -256,10 +282,29 @@ void XMLCALL ContentOpfParser::startElement(void* userData, const XML_Char* name
           // Entries sharing a hash and length are adjacent, so walk them until the id itself matches.
           // Anything beyond that group differs in hash or length and therefore cannot be this idref.
           while (it != self->itemIndex.end() && it->idHash == target.idHash && it->idLen == target.idLen) {
-            self->tempItemStore.seek(it->fileOffset);
-            std::string itemId;
-            serialization::readString(self->tempItemStore, itemId);
+            // Read the id's length prefix and check it against the index before trusting the offset.
+            // A failed or short SD write during <manifest> can leave later entries pointing at EOF or
+            // into the middle of a record, and serialization::readString would then resize a
+            // std::string to an uninitialised or bogus length - fatal under -fno-exceptions. The
+            // linear scan this replaces was bounded by available(), so it degraded to "not found".
+            uint32_t storedIdLen = 0;
+            if (!self->tempItemStore.seek(it->fileOffset) ||
+                self->tempItemStore.read(&storedIdLen, sizeof(storedIdLen)) != static_cast<int>(sizeof(storedIdLen)) ||
+                static_cast<uint16_t>(storedIdLen) != it->idLen ||
+                storedIdLen > static_cast<uint32_t>(self->tempItemStore.available())) {
+              LOG_ERR("COF", "Item store does not hold a record at offset %lu", it->fileOffset);
+              ++it;
+              continue;
+            }
+
+            std::string itemId(storedIdLen, '\0');
+            if (storedIdLen > 0 && self->tempItemStore.read(&itemId[0], storedIdLen) != static_cast<int>(storedIdLen)) {
+              ++it;
+              continue;
+            }
+
             if (itemId == idref) {
+              // The id matched, so this is a real record start and the href prefix follows it
               serialization::readString(self->tempItemStore, href);
               found = true;
               break;
